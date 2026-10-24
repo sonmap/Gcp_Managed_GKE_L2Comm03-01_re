@@ -5,6 +5,69 @@ NFS 설정만 setup-nfs-server.sh를 사용한다. 기존 run-gke.sh / client_gk
 명령은 실제 클라우드에 적용하지 않은 절차이며 각 단계 출력 확인 후 다음 단계로 진행한다.
 기존 리소스가 있으면 describe로 확인하고 create를 생략한다. 실패를 무시하고 진행하지 않는다.
 
+## 사전 준비. OS와 gcloud만 있는 두 VM의 도구 설치
+
+l2comn-dev와 central02 각각 SSH 접속 후 실행한다. gcloud는 이미 설치되어 있으므로 재설치하지 않는다.
+아래는 VM 내부 패키지 설치 명령이며 별도 설치 sh 파일을 만들지 않는다.
+
+| 도구 | l2comn-dev | central02 | 용도 |
+|---|---|---|---|
+| git | 설치 | 설치 | 동일 저장소 clone/pull |
+| python3 | 설치 | 설치 | client_gke 보조 처리와 점검 |
+| python3-venv, python3-pip | 설치 | 설치 | 필요 시 분리된 로컬 Python 환경 |
+| kubectl | 설치 | 설치 | 클러스터 확인, central02의 Pod 생성 |
+| gke-gcloud-auth-plugin | 설치 | 설치 | GKE 인증 |
+| nfs-kernel-server | 설치 안 함 | NFS sh에서 설치 | NFS 서버 |
+| Docker / Helm | 필수 아님 | 필수 아님 | 빌드는 Cloud Build, 실행은 기존 client_gke |
+
+### A. 공통 패키지 — 두 VM 각각
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git python3 python3-venv python3-pip ca-certificates curl gnupg
+git --version
+python3 --version
+python3 -m pip --version
+gcloud version
+```
+
+### B. GKE 도구 — 두 VM 각각
+
+Google Cloud CLI의 APT 저장소가 이미 등록되어 있는 경우 다음을 실행한다.
+
+```bash
+sudo apt-get install -y kubectl google-cloud-cli-gke-gcloud-auth-plugin
+kubectl version --client
+gke-gcloud-auth-plugin --version
+```
+
+패키지를 찾지 못하면 아래 명령으로 Google Cloud APT 저장소를 등록한 후 B를 다시 실행한다.
+기존 google-cloud-sdk 항목이 다른 파일에 있으면 같은 저장소를 중복 등록하지 말고 기존 항목의 서명 설정을 확인한다.
+
+```bash
+sudo mkdir -p /usr/share/keyrings
+curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+  | sudo gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+  | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+sudo apt-get update
+sudo apt-get install -y kubectl google-cloud-cli-gke-gcloud-auth-plugin
+kubectl version --client
+gke-gcloud-auth-plugin --version
+```
+
+APT 방식으로 gcloud를 설치한 VM에서는 gcloud components install 대신 위 APT 방식을 사용한다.
+패키지 다운로드와 git clone에는 기존 NAT/사내 프록시/인터넷 중계 경로가 필요하다.
+외부 IP가 없는 VM에 IAP SSH가 된다고 인터넷 다운로드가 가능한 것은 아니다.
+apt update 또는 curl이 실패하면 우선 기존 승인된 외부 통신 경로를 확인한다.
+
+### C. Python 실행 위치
+
+VM의 Python 3는 도구용이다. 실제 BigQuery 배치는 Pod 안에서 실행한다.
+google-cloud-bigquery 등 업무 의존성은 기존 app/requirements.txt와 Dockerfile로 이미지에 설치한다.
+두 VM에 업무용 pip 패키지를 일괄 설치할 필요는 없다. 로컬 검증이 필요한 경우에만 별도 venv를 사용한다.
+NFS sh는 central02에서만 실행하고 l2comn-dev에는 mnt 마운트를 구성하지 않는다.
+
 ## 0. 프로젝트와 변수 — 각 작업 터미널에서 정의
 
 | 변수 | 프로젝트 | 역할 |
