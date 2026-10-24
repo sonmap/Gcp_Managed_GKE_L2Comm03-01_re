@@ -297,6 +297,7 @@ gcloud container clusters create-auto "$CLUSTER" \
   --cluster-secondary-range-name="$POD_RANGE" \
   --private-endpoint-subnetwork="projects/${HOST_PROJECT}/regions/${REGION}/subnetworks/${CP_SUBNET}" \
   --enable-private-nodes --enable-private-endpoint \
+  --enable-master-authorized-networks \
   --no-enable-authorized-networks-on-private-endpoint \
   --service-account="$NODE_SA" --scopes=cloud-platform \
   --release-channel="$RELEASE_CHANNEL"
@@ -304,7 +305,8 @@ gcloud container clusters create-auto "$CLUSTER" \
 gcloud container clusters describe "$CLUSTER" --project="$SVC_PROJECT" --region="$REGION"
 ```
 
-관리 VM IP는 승인 네트워크에 등록하지 않고 Private Endpoint에 승인 네트워크 제한을 강제하지 않는 설계다.
+--enable-private-endpoint 사용 시 API가 요구하는 --enable-master-authorized-networks를 함께 지정한다.
+--no-enable-authorized-networks-on-private-endpoint는 유지한다. 관리 VM IP는 승인 네트워크에 등록하지 않고 Private Endpoint에 승인 네트워크 제한을 강제하지 않는 설계다.
 TCP 443 경로와 IAM/Kubernetes 인증은 별도로 필요하다. 다른 리전에서 접속하면 global access 필요 여부를 확인한다.
 위 설정은 사설 Endpoint에 도달 가능한 다른 호스트도 네트워크 차원에서 접근할 수 있게 하며, API 작업에는 인증·권한이 필요하다.
 
