@@ -452,7 +452,7 @@ gcloud artifacts docker images list \
 kubectl get pods -n l2comm-batch
 export POD_NAME="l2comm-20261024-120000-20261024122226"
 kubectl get pod "$POD_NAME" -n l2comm-batch \
-  -o jsonpath='{.spec.containers[0].image}{"\\n"}'
+  -o jsonpath='{.spec.containers[0].image}{"\n"}'
 kubectl describe pod "$POD_NAME" -n l2comm-batch
 ```
 
