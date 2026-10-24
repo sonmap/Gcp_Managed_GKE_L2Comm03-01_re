@@ -280,6 +280,100 @@ gcloud auth login "$SVC_OWNER"
 gcloud beta services identity create --service=container.googleapis.com --project="$SVC_PROJECT"
 ```
 
+### 3-A-1. Host와 SVC에 GKE Service Agent가 모두 필요한 이유
+
+Shared VPC GKE 구성에서는 Host와 SVC 양쪽에 GKE API와 해당 프로젝트의 GKE Service Agent가 필요하다.
+Host에는 GKE 클러스터를 만들 필요가 없다. Host Agent의 존재·기본 역할과 SVC Agent의 Host 사용 권한은 별개다.
+서비스 ID 준비는 클러스터 생성이나 Node SA 생성이 아니다.
+
+| 구분 | Host | SVC |
+|---|---|---|
+| 프로젝트 | gcp-prod-edp-hub-vpchost | gcp-sbx-edp-comn-509423 |
+| 프로젝트 번호 | 620081195575 | 1003210826985 |
+| GKE Service Agent | service-620081195575@container-engine-robot.iam.gserviceaccount.com | service-1003210826985@container-engine-robot.iam.gserviceaccount.com |
+| 자기 프로젝트 기본 역할 | roles/container.serviceAgent | roles/container.serviceAgent |
+| Shared VPC 추가 역할 | SVC로 역방향 권한 부여하지 않음 | Host에 hostServiceAgentUser, Host Node·CP 서브넷에 networkUser |
+
+전체 이미지: [SA·프로젝트·네트워크 구성도](images/l2comm-sa-permissions.png)
+
+![L2Comm SA 권한 구성도](images/l2comm-sa-permissions.png)
+
+이미지는 전체 흐름 참조용이다. 실제 권한의 수신 주체·적용 리소스는 이 절과 3-B 표 및 명령을 기준으로 한다.
+특히 container.admin과 Node SA의 iam.serviceAccountUser는 cho에게 부여하며,
+Google APIs Service Agent에 이 사용자 역할들을 부여하는 것은 아니다.
+
+#### A. admin으로 API 및 서비스 ID 준비
+
+기존 3-A와 동일한 작업을 명시적 프로젝트 값으로 표현한 것이다. 이미 준비되어 있으면 중복 수행할 필요 없다.
+
+```bash
+gcloud auth login admin@sonmap.net
+
+export HOST_PROJECT="gcp-prod-edp-hub-vpchost"
+export SVC_PROJECT="gcp-sbx-edp-comn-509423"
+export REGION="asia-northeast3"
+export HOST_AGENT="service-620081195575@container-engine-robot.iam.gserviceaccount.com"
+export SVC_AGENT="service-1003210826985@container-engine-robot.iam.gserviceaccount.com"
+
+gcloud services enable container.googleapis.com --project="$HOST_PROJECT"
+gcloud services enable container.googleapis.com --project="$SVC_PROJECT"
+
+gcloud beta services identity create \
+  --service=container.googleapis.com --project="$HOST_PROJECT"
+gcloud beta services identity create \
+  --service=container.googleapis.com --project="$SVC_PROJECT"
+```
+
+#### B. 자기 프로젝트 기본 역할 확인·누락 시 복구
+
+다음으로 정책을 조회해 위 표의 각 서비스 에이전트가 자기 프로젝트에서
+roles/container.serviceAgent를 보유하는지 확인한다. 다른 멤버의 역할만 보고 판단하지 않는다.
+
+```bash
+gcloud projects get-iam-policy "$HOST_PROJECT" --format=yaml
+gcloud projects get-iam-policy "$SVC_PROJECT" --format=yaml
+```
+
+기본 역할은 보통 자동 부여된다. 누락됐을 때만 admin으로 해당 바인딩을 복구한다.
+이 서비스 에이전트 역할은 사용자 계정이나 직접 만든 Node SA에 부여하지 않는다.
+
+```bash
+gcloud projects add-iam-policy-binding "$HOST_PROJECT" \
+  --member="serviceAccount:${HOST_AGENT}" \
+  --role=roles/container.serviceAgent --condition=None
+
+gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
+  --member="serviceAccount:${SVC_AGENT}" \
+  --role=roles/container.serviceAgent --condition=None
+```
+
+#### C. SVC Agent에 Host 사용 권한 부여
+
+다음은 3-B 중 GKE Service Agent에 대한 부분이다. 3-B를 이미 적용했다면 다시 추가할 필요 없다.
+
+```bash
+gcloud projects add-iam-policy-binding "$HOST_PROJECT" \
+  --member="serviceAccount:${SVC_AGENT}" \
+  --role=roles/container.hostServiceAgentUser --condition=None
+
+gcloud compute networks subnets add-iam-policy-binding subnet-prod-l2comn-gke \
+  --project="$HOST_PROJECT" --region="$REGION" \
+  --member="serviceAccount:${SVC_AGENT}" \
+  --role=roles/compute.networkUser --condition=None
+
+gcloud compute networks subnets add-iam-policy-binding subnet-prod-l2comn-gke-cp \
+  --project="$HOST_PROJECT" --region="$REGION" \
+  --member="serviceAccount:${SVC_AGENT}" \
+  --role=roles/compute.networkUser --condition=None
+```
+
+권한 방향은 SVC Agent가 Host 리소스를 사용하도록 허용하는 방향이다.
+Host Agent에 SVC 프로젝트의 GKE 관리 권한을 반대로 부여하지 않는다.
+Google APIs Service Agent 및 cho의 서브넷 권한은 다음 3-B 전체 절차를 유지한다.
+생성 VM은 명령 실행 위치이며 networkUser를 생성 VM 프로젝트 자체에 부여하는 구성이 아니다.
+
+공식 근거: https://docs.cloud.google.com/kubernetes-engine/docs/how-to/cluster-shared-vpc
+
 ### 3-B. Host 프로젝트·서브넷 권한 — admin@sonmap.net
 
 SVC 서비스 에이전트와 cho 계정에 부여하더라도 적용 리소스가 Host이므로 Host Owner가 실행한다.
