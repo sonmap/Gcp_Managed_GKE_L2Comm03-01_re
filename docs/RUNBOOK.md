@@ -5,6 +5,22 @@ NFS 설정만 setup-nfs-server.sh를 사용한다. 기존 run-gke.sh / client_gk
 명령은 실제 클라우드에 적용하지 않은 절차이며 각 단계 출력 확인 후 다음 단계로 진행한다.
 기존 리소스가 있으면 describe로 확인하고 create를 생략한다. 실패를 무시하고 진행하지 않는다.
 
+## 수행 Owner와 프로젝트
+
+| 적용 프로젝트 | Owner | 수행 작업 |
+|---|---|---|
+| HOST_PROJECT: gcp-prod-edp-hub-vpchost | admin@sonmap.net | Host API/서비스 ID, 서브넷, Host IAM, 방화벽 |
+| EDGE_PROJECT: gcp-sbx-edp-gke01 | user01@sonmap.net | Edge API, AR/Build SA/IAM, central02 태그 |
+| SVC_PROJECT: gcp-sbx-edp-comn-509423 | cho@sonmap.net | SVC API/서비스 ID, Node SA/IAM, GKE 생성, 실행 사용자 권한 |
+| CREATE_VM_PROJECT: gcp-prod-edp-edge-509423 | cho@sonmap.net | l2comn-dev 관리. GKE 생성 대상은 SVC_PROJECT |
+
+admin@sonmap.net은 전체 관리자이므로 다른 프로젝트 작업을 대행할 수 있지만, 이 절차에서는 각 Owner가 담당한다.
+VM 위치가 권한 적용 프로젝트를 결정하지 않는다. 명령의 --project와 실제 인증 계정이 기준이다.
+Shared VPC 연결 변경은 프로젝트 Owner만으로 충분하지 않으며 별도의 Shared VPC Admin 권한이 필요하다.
+각 계정은 자기 프로젝트 번호를 조회해 다른 담당자에게 공유한다. 다른 프로젝트 describe 권한이 없다면
+0절의 네 프로젝트 번호 일괄 조회를 강행하지 말고 공유받은 번호를 export한다.
+gcloud auth login 이후 ACTIVE 계정을 확인한다. 이미 인증되어 있으면 gcloud config set account EMAIL로 전환할 수 있다.
+
 ## 사전 준비. OS와 gcloud만 있는 두 VM의 도구 설치
 
 l2comn-dev와 central02 각각 SSH 접속 후 실행한다. gcloud는 이미 설치되어 있으므로 재설치하지 않는다.
@@ -107,6 +123,10 @@ export RELEASE_CHANNEL="regular"
 export CREATE_VM_ACCOUNT="cho@sonmap.net"
 export EXEC_ACCOUNT="user01@sonmap.net"
 export ADMIN_ACCOUNT="admin@sonmap.net"
+export HOST_OWNER="$ADMIN_ACCOUNT"
+export EDGE_OWNER="$EXEC_ACCOUNT"
+export SVC_OWNER="$CREATE_VM_ACCOUNT"
+export CREATE_VM_OWNER="$CREATE_VM_ACCOUNT"
 export NODE_SA="sa-l2comm-node@${SVC_PROJECT}.iam.gserviceaccount.com"
 export BUILD_SA="sa-l2comm-build@${EDGE_PROJECT}.iam.gserviceaccount.com"
 export REPO_NAME="ar-l2comm-python"
@@ -123,8 +143,17 @@ export DOCKER_IMAGE="${REGION}-docker.pkg.dev/${EDGE_PROJECT}/${REPO_NAME}/pytho
 gcloud auth login "$ADMIN_ACCOUNT"
 gcloud auth list --filter=status:ACTIVE
 gcloud services enable compute.googleapis.com container.googleapis.com --project="$HOST_PROJECT"
+
+# SVC Owner: cho@sonmap.net
+gcloud auth login "$SVC_OWNER"
 gcloud services enable compute.googleapis.com container.googleapis.com iam.googleapis.com --project="$SVC_PROJECT"
+
+# Edge Owner: user01@sonmap.net
+gcloud auth login "$EDGE_OWNER"
 gcloud services enable compute.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com iam.googleapis.com --project="$EDGE_PROJECT"
+
+# 전체 관리자: Shared VPC 상태 조회
+gcloud auth login "$HOST_OWNER"
 
 gcloud compute shared-vpc get-host-project "$SVC_PROJECT"
 gcloud compute shared-vpc get-host-project "$EDGE_PROJECT"
@@ -141,9 +170,10 @@ gcloud compute shared-vpc associated-projects add "$SVC_PROJECT" --host-project=
 gcloud compute shared-vpc associated-projects add "$EDGE_PROJECT" --host-project="$HOST_PROJECT"
 ```
 
-## 2. Host 관리자 — 네트워크
+## 2. Host Owner admin@sonmap.net — 네트워크
 
 ```bash
+gcloud auth login "$HOST_OWNER"
 gcloud compute networks subnets create "$NODE_SUBNET" \
   --project="$HOST_PROJECT" --region="$REGION" --network="$NETWORK" \
   --range="$NODE_CIDR" --secondary-range="${POD_RANGE}=${POD_CIDR}" \
@@ -161,11 +191,28 @@ gcloud compute networks subnets describe "$CP_SUBNET" --project="$HOST_PROJECT" 
 Private Google Access는 인터넷 연결을 제공하지 않는다. VM의 apt/GitHub 접속은 기존 사내 프록시·NAT 등의 경로가 필요하다.
 이 절차는 NAT를 새로 만들지 않는다.
 
-## 3. 관리자 — GKE 서비스 에이전트와 Node SA
+## 3. Owner별 — GKE 서비스 에이전트와 Node SA
+
+수행 순서: 3-A 서비스 ID 준비 → 3-B Host 권한 → 3-C Node SA → 3-D 선택 방화벽 권한.
+
+### 3-A. 서비스 ID 생성 — 각 프로젝트 Owner
 
 ```bash
+# Host Owner: admin@sonmap.net
+gcloud auth login "$HOST_OWNER"
 gcloud beta services identity create --service=container.googleapis.com --project="$HOST_PROJECT"
+
+# SVC Owner: cho@sonmap.net
+gcloud auth login "$SVC_OWNER"
 gcloud beta services identity create --service=container.googleapis.com --project="$SVC_PROJECT"
+```
+
+### 3-B. Host 프로젝트·서브넷 권한 — admin@sonmap.net
+
+SVC 서비스 에이전트와 cho 계정에 부여하더라도 적용 리소스가 Host이므로 Host Owner가 실행한다.
+
+```bash
+gcloud auth login "$HOST_OWNER"
 
 gcloud projects add-iam-policy-binding "$HOST_PROJECT" \
   --member="serviceAccount:service-${SVC_PROJECT_NUM}@container-engine-robot.iam.gserviceaccount.com" \
@@ -199,9 +246,19 @@ gcloud compute networks subnets add-iam-policy-binding "$CP_SUBNET" \
   --project="$HOST_PROJECT" --region="$REGION" \
   --member="user:${CREATE_VM_ACCOUNT}" --role=roles/compute.networkUser
 
+```
+
+### 3-C. SVC 프로젝트 Node SA 및 권한 — cho@sonmap.net
+
+기존 SA가 있으면 create를 생략한다. Owner는 사용자 생성 권한을 이미 갖지만 Node SA에 필요한 역할은 별도로 부여한다.
+
+```bash
+gcloud auth login "$SVC_OWNER"
 gcloud iam service-accounts create sa-l2comm-node --project="$SVC_PROJECT"
 gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
   --member="serviceAccount:${NODE_SA}" --role=roles/container.defaultNodeServiceAccount
+# cho는 현재 SVC Owner이므로 아래 세 가지 사용자 바인딩은 추가하지 않아도 된다.
+# 향후 Owner를 제거하고 위임 권한으로 운영할 때 필요한 명시적 역할 예시다.
 gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
   --member="user:${CREATE_VM_ACCOUNT}" --role=roles/container.admin
 gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
@@ -210,10 +267,13 @@ gcloud iam service-accounts add-iam-policy-binding "$NODE_SA" \
   --project="$SVC_PROJECT" --member="user:${CREATE_VM_ACCOUNT}" --role=roles/iam.serviceAccountUser
 ```
 
+### 3-D. Host 방화벽 자동 관리 권한 — admin@sonmap.net (선택)
+
 Shared VPC 방화벽 자동 관리를 허용하는 운영 방식을 사용할 경우, SVC의 GKE 서비스 에이전트에 다음 권한을 적용한다.
 compute.securityAdmin은 Host 전체 방화벽에 대한 넓은 권한이다. 조직에서 허용하지 않으면 Host 관리자가 공식 GKE 필수 방화벽을 수동 관리하는 방식으로 대체한 후 생성한다.
 
 ```bash
+gcloud auth login "$HOST_OWNER"
 gcloud projects add-iam-policy-binding "$HOST_PROJECT" \
   --member="serviceAccount:service-${SVC_PROJECT_NUM}@container-engine-robot.iam.gserviceaccount.com" \
   --role=roles/compute.securityAdmin
@@ -241,10 +301,10 @@ gcloud container clusters describe "$CLUSTER" --project="$SVC_PROJECT" --region=
 TCP 443 경로와 IAM/Kubernetes 인증은 별도로 필요하다. 다른 리전에서 접속하면 global access 필요 여부를 확인한다.
 위 설정은 사설 Endpoint에 도달 가능한 다른 호스트도 네트워크 차원에서 접근할 수 있게 하며, API 작업에는 인증·권한이 필요하다.
 
-## 5. 관리자 — AR와 빌드
+## 5. Edge Owner user01@sonmap.net — AR와 빌드 권한
 
 ```bash
-gcloud auth login "$ADMIN_ACCOUNT"
+gcloud auth login "$EDGE_OWNER"
 gcloud artifacts repositories create "$REPO_NAME" --project="$EDGE_PROJECT" \
   --location="$REGION" --repository-format=docker
 gcloud iam service-accounts create sa-l2comm-build --project="$EDGE_PROJECT"
@@ -323,11 +383,16 @@ NFSv4 fsid=0을 사용하며 Pod는 /batch_gke/l2/rsvp를 /home/jupyter에 읽�
 .oefj는 기존 승인된 키를 central02의 mnt/batch_gke/l2/rsvp/.oefj에 안전하게 배치한다. Git에 추가하지 않는다.
 root_squash 및 Pod 실행 UID 기준으로 읽기 가능한지 확인한다. 키 생성·조직 정책 변경은 수행하지 않는다.
 
-Host 관리자가 실행한다. IAP SSH 규칙은 기존 규칙을 확인한 후 필요한 경우만 추가한다.
+central02 태그는 Edge Owner user01@sonmap.net이, Host 방화벽은 admin@sonmap.net이 실행한다.
+IAP SSH 규칙은 기존 규칙을 확인한 후 필요한 경우만 추가한다.
 
 ```bash
+gcloud auth login "$EDGE_OWNER"
 gcloud compute instances add-tags central02 --project="$EDGE_PROJECT" --zone="$VM_ZONE" \
   --tags=iap-ssh-central02,l2comm-nfs
+
+# Host Owner
+gcloud auth login "$HOST_OWNER"
 gcloud compute firewall-rules create allow-l2comm-nfs-from-gke --project="$HOST_PROJECT" \
   --network="$NETWORK" --direction=INGRESS --priority=1000 --action=ALLOW \
   --rules=tcp:2049 --source-ranges="$NODE_CIDR" --target-tags=l2comm-nfs
@@ -340,12 +405,13 @@ NFS 마운트는 Node에서 발생하므로 Node CIDR을 허용한다. 상위 de
 central02는 Spot VM이므로 정지·회수 시 NFS도 중단된다. 재시작 후 bind mount/export 상태를 확인한다.
 이 구성에서 Filestore는 새로 생성하지 않는다.
 
-## 8. 관리자 — central02 실행 사용자의 GKE 권한
+## 8. SVC Owner cho@sonmap.net — central02 실행 사용자의 GKE 권한
 
 기존 client_gke는 Namespace/KSA/PV/PVC/Pod를 생성·적용한다. PV와 Namespace는 클러스터 범위 리소스다.
 변경을 최소화하는 PoC로 container.admin을 부여한다. 운영에서는 초기 생성과 실행을 분리하여 권한을 축소한다.
 
 ```bash
+gcloud auth login "$SVC_OWNER"
 gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
   --member="user:${EXEC_ACCOUNT}" --role=roles/container.admin
 ```
@@ -383,7 +449,7 @@ export DRY_RUN=1
 기존 PV/PVC의 server/path 변경은 불변 필드 제약을 확인한다. 자동 삭제·재생성하지 않는다.
 키 소유 SA에는 기존 BigQuery job/data 권한이 필요하다. BQ 인증 방식은 유지한다.
 
-## 10. 確認
+## 10. 확인
 
 ```bash
 gcloud container clusters describe "$CLUSTER" --project="$SVC_PROJECT" --region="$REGION" \
