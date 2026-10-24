@@ -48,35 +48,105 @@ python3 -m pip --version
 gcloud version
 ```
 
-### B. GKE 도구 — 두 VM 각각
+### B. kubectl·GKE 인증 플러그인 설치 — 두 VM 각각
 
-Google Cloud CLI의 APT 저장소가 이미 등록되어 있는 경우 다음을 실행한다.
+l2comn-dev와 central02에서 각각 수행한다. gcloud가 설치되어 있어도 kubectl과 인증 플러그인은 별도 설치가 필요하다.
+이 단계의 설치 확인이 성공하기 전에는 kubectl get nodes를 반복하지 않는다.
+
+#### B-1. 설치 실패 증상과 원인
+
+| 증상 | 의미 | 조치 |
+|---|---|---|
+| kubectl: command not found | 실행 파일 미설치 또는 PATH 미등록 | 아래 설치 후 command -v 확인 |
+| gke-gcloud-auth-plugin: command not found | GKE 인증 도구 미설치 또는 PATH 미등록 | 아래 설치 후 버전 확인 |
+| E: Unable to locate package kubectl | APT 목록에서 패키지를 찾지 못함 | Google Cloud 저장소 등록·갱신 확인 |
+| E: Unable to locate package google-cloud-cli-gke-gcloud-auth-plugin | APT 목록에서 플러그인을 찾지 못함 | 동일 |
+| kubeconfig entry generated | 접속 설정 파일만 생성됨 | 도구 설치 성공을 의미하지 않음 |
+
+이번 l2comn-dev에서는 apt-get update에 Ubuntu jammy 저장소만 표시되고 Google Cloud 저장소가 표시되지 않았다.
+따라서 Google Cloud APT 저장소 등록부터 진행한다. hash -r이나 get-credentials는 패키지를 설치하지 않는다.
+
+#### B-2. 기존 저장소 확인
 
 ```bash
-sudo apt-get install -y kubectl google-cloud-cli-gke-gcloud-auth-plugin
-kubectl version --client
-gke-gcloud-auth-plugin --version
+sudo rg 'packages.cloud.google.com/apt' /etc/apt/sources.list /etc/apt/sources.list.d
 ```
 
-패키지를 찾지 못하면 아래 명령으로 Google Cloud APT 저장소를 등록한 후 B를 다시 실행한다.
-기존 google-cloud-sdk 항목이 다른 파일에 있으면 같은 저장소를 중복 등록하지 말고 기존 항목의 서명 설정을 확인한다.
+rg가 설치되지 않은 기본 Ubuntu에서는 다음 명령을 사용한다.
 
 ```bash
+sudo grep -R 'packages.cloud.google.com/apt' /etc/apt/sources.list /etc/apt/sources.list.d
+```
+
+등록 내역이 없으면 B-3을 수행한다. 이미 다른 파일에 동일 저장소가 있으면 중복 추가하지 않고 기존 서명 설정을 확인한 뒤 B-4로 진행한다.
+검색 결과가 없는 경우의 종료 코드 1은 미등록을 의미한다.
+
+#### B-3. 필수 도구·서명 키·Google Cloud 저장소 등록
+
+아래 블록을 순서대로 실행한다. 각 블록이 실패하면 다음으로 진행하지 않는다.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
 sudo mkdir -p /usr/share/keyrings
+```
+
+서명 키를 먼저 내려받는다. curl 실패를 놓치지 않도록 다운로드와 키 변환을 분리한다.
+
+```bash
 curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-  | sudo gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg
+  -o /tmp/l2comm-google-cloud-apt-key.asc
+```
+
+```bash
+sudo gpg --dearmor --yes \
+  -o /usr/share/keyrings/cloud.google.gpg \
+  /tmp/l2comm-google-cloud-apt-key.asc
+sudo chmod 0644 /usr/share/keyrings/cloud.google.gpg
+```
+
+```bash
 echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
   | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+```
+
+#### B-4. 패키지 목록 갱신 및 설치
+
+```bash
 sudo apt-get update
+```
+
+출력에 packages.cloud.google.com의 cloud-sdk 저장소가 표시되고 서명·다운로드 오류가 없는지 확인한다.
+Ubuntu 저장소만 나타나면 B-2/B-3 등록 상태를 확인한다.
+
+```bash
+apt-cache policy kubectl google-cloud-cli-gke-gcloud-auth-plugin
+```
+
+두 패키지의 Candidate에 설치 가능한 버전이 표시되어야 한다. Candidate: (none)이면 아직 설치하지 말고 저장소 갱신 오류를 확인한다.
+
+```bash
 sudo apt-get install -y kubectl google-cloud-cli-gke-gcloud-auth-plugin
+```
+
+#### B-5. 설치 확인
+
+```bash
+hash -r
+command -v kubectl
+command -v gke-gcloud-auth-plugin
 kubectl version --client
 gke-gcloud-auth-plugin --version
 ```
+
+두 실행 경로와 버전이 모두 출력되어야 한다. 계속 command not found이면 설치 명령의 전체 출력을 확인한다.
+GKE 생성 이후에는 8절에서 get-credentials 후 kubectl 접속을 확인한다. 4절 생성 계정 cho도 동일한 도구를 사용한다.
 
 APT 방식으로 gcloud를 설치한 VM에서는 gcloud components install 대신 위 APT 방식을 사용한다.
 패키지 다운로드와 git clone에는 기존 NAT/사내 프록시/인터넷 중계 경로가 필요하다.
 외부 IP가 없는 VM에 IAP SSH가 된다고 인터넷 다운로드가 가능한 것은 아니다.
-apt update 또는 curl이 실패하면 우선 기존 승인된 외부 통신 경로를 확인한다.
+curl 또는 apt update 실패 시 오류 출력을 확인하고 기존 승인된 외부 통신 경로를 점검한다.
+이 절차는 별도 sh 파일을 만들지 않으며 GCP IAM·클러스터 설정을 변경하지 않는다.
 
 ### C. Python 실행 위치
 
