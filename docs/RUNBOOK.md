@@ -7,14 +7,15 @@ NFS 설정만 setup-nfs-server.sh를 사용한다. 기존 run-gke.sh / client_gk
 
 ## 수행 Owner와 프로젝트
 
-| 적용 프로젝트 | Owner | 수행 작업 |
+| 적용 프로젝트 | 수행 관리자·사용자 | 수행 작업 |
 |---|---|---|
 | HOST_PROJECT: gcp-prod-edp-hub-vpchost | admin@sonmap.net | Host API/서비스 ID, 서브넷, Host IAM, 방화벽 |
 | EDGE_PROJECT: gcp-sbx-edp-gke01 | user01@sonmap.net | Edge API, AR/Build SA/IAM, central02 태그 |
-| SVC_PROJECT: gcp-sbx-edp-comn-509423 | cho@sonmap.net | SVC API/서비스 ID, Node SA/IAM, GKE 생성, 실행 사용자 권한 |
+| SVC_PROJECT: gcp-sbx-edp-comn-509423 | admin@sonmap.net: 관리자 / cho@sonmap.net: GKE 생성 사용자 | admin: API/서비스 ID, Node SA/IAM, 사용자 권한 부여 / cho: GKE 생성 |
 | CREATE_VM_PROJECT: gcp-prod-edp-edge-509423 | cho@sonmap.net | l2comn-dev 관리. GKE 생성 대상은 SVC_PROJECT |
 
-admin@sonmap.net은 전체 관리자이므로 다른 프로젝트 작업을 대행할 수 있지만, 이 절차에서는 각 Owner가 담당한다.
+admin@sonmap.net은 전체 관리자이며 SVC의 API·서비스 ID·SA 생성·IAM 설정을 담당한다.
+cho@sonmap.net은 SVC Owner가 아님을 확인했다. admin이 위임한 권한으로 GKE 생성만 수행한다.
 VM 위치가 권한 적용 프로젝트를 결정하지 않는다. 명령의 --project와 실제 인증 계정이 기준이다.
 Shared VPC 연결 변경은 프로젝트 Owner만으로 충분하지 않으며 별도의 Shared VPC Admin 권한이 필요하다.
 각 계정은 자기 프로젝트 번호를 조회해 다른 담당자에게 공유한다. 다른 프로젝트 describe 권한이 없다면
@@ -125,7 +126,7 @@ export EXEC_ACCOUNT="user01@sonmap.net"
 export ADMIN_ACCOUNT="admin@sonmap.net"
 export HOST_OWNER="$ADMIN_ACCOUNT"
 export EDGE_OWNER="$EXEC_ACCOUNT"
-export SVC_OWNER="$CREATE_VM_ACCOUNT"
+export SVC_OWNER="$ADMIN_ACCOUNT"  # SVC 관리 작업 담당. cho는 GKE 생성 사용자
 export CREATE_VM_OWNER="$CREATE_VM_ACCOUNT"
 export NODE_SA="sa-l2comm-node@${SVC_PROJECT}.iam.gserviceaccount.com"
 export BUILD_SA="sa-l2comm-build@${EDGE_PROJECT}.iam.gserviceaccount.com"
@@ -144,7 +145,7 @@ gcloud auth login "$ADMIN_ACCOUNT"
 gcloud auth list --filter=status:ACTIVE
 gcloud services enable compute.googleapis.com container.googleapis.com --project="$HOST_PROJECT"
 
-# SVC Owner: cho@sonmap.net
+# SVC 관리자: admin@sonmap.net
 gcloud auth login "$SVC_OWNER"
 gcloud services enable compute.googleapis.com container.googleapis.com iam.googleapis.com --project="$SVC_PROJECT"
 
@@ -195,7 +196,7 @@ Private Google Access는 인터넷 연결을 제공하지 않는다. VM의 apt/G
 
 수행 순서: 3-A 서비스 ID 준비 → 3-B Host 권한 → 3-C Node SA → 3-D 선택 방화벽 권한.
 
-### 3-A. 서비스 ID 생성 — 각 프로젝트 Owner
+### 3-A. Host·SVC 서비스 ID 생성 — admin@sonmap.net
 
 ```bash
 # Host Owner: admin@sonmap.net
@@ -248,23 +249,29 @@ gcloud compute networks subnets add-iam-policy-binding "$CP_SUBNET" \
 
 ```
 
-### 3-C. SVC 프로젝트 Node SA 및 권한 — cho@sonmap.net
+### 3-C. SVC 프로젝트 Node SA 및 권한 — admin@sonmap.net
 
-기존 SA가 있으면 create를 생략한다. Owner는 사용자 생성 권한을 이미 갖지만 Node SA에 필요한 역할은 별도로 부여한다.
+기존 SA가 있으면 create를 생략한다. SA 생성 및 IAM 변경은 admin@sonmap.net이 수행한다.
+cho@sonmap.net에는 SVC Owner 권한이 없으므로 아래 세 가지 사용자 바인딩을 모두 적용한다.
+SA 생성이 실패하면 이후 권한 부여를 진행하지 않는다. 기존 터미널에서는 SVC_OWNER를 반드시 다시 정의한다.
+
+```bash
+export SVC_OWNER="admin@sonmap.net"
+export CREATE_VM_ACCOUNT="cho@sonmap.net"
+```
 
 ```bash
 gcloud auth login "$SVC_OWNER"
 gcloud iam service-accounts create sa-l2comm-node --project="$SVC_PROJECT"
 gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
-  --member="serviceAccount:${NODE_SA}" --role=roles/container.defaultNodeServiceAccount
-# cho는 현재 SVC Owner이므로 아래 세 가지 사용자 바인딩은 추가하지 않아도 된다.
-# 향후 Owner를 제거하고 위임 권한으로 운영할 때 필요한 명시적 역할 예시다.
+  --member="serviceAccount:${NODE_SA}" --role=roles/container.defaultNodeServiceAccount --condition=None
+# cho는 SVC Owner가 아니므로 다음 세 역할을 모두 부여한다.
 gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
-  --member="user:${CREATE_VM_ACCOUNT}" --role=roles/container.admin
+  --member="user:${CREATE_VM_ACCOUNT}" --role=roles/container.admin --condition=None
 gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
-  --member="user:${CREATE_VM_ACCOUNT}" --role=roles/serviceusage.serviceUsageConsumer
+  --member="user:${CREATE_VM_ACCOUNT}" --role=roles/serviceusage.serviceUsageConsumer --condition=None
 gcloud iam service-accounts add-iam-policy-binding "$NODE_SA" \
-  --project="$SVC_PROJECT" --member="user:${CREATE_VM_ACCOUNT}" --role=roles/iam.serviceAccountUser
+  --project="$SVC_PROJECT" --member="user:${CREATE_VM_ACCOUNT}" --role=roles/iam.serviceAccountUser --condition=None
 ```
 
 ### 3-D. Host 방화벽 자동 관리 권한 — admin@sonmap.net (선택)
@@ -405,7 +412,7 @@ NFS 마운트는 Node에서 발생하므로 Node CIDR을 허용한다. 상위 de
 central02는 Spot VM이므로 정지·회수 시 NFS도 중단된다. 재시작 후 bind mount/export 상태를 확인한다.
 이 구성에서 Filestore는 새로 생성하지 않는다.
 
-## 8. SVC Owner cho@sonmap.net — central02 실행 사용자의 GKE 권한
+## 8. SVC 관리자 admin@sonmap.net — central02 실행 사용자의 GKE 권한
 
 기존 client_gke는 Namespace/KSA/PV/PVC/Pod를 생성·적용한다. PV와 Namespace는 클러스터 범위 리소스다.
 변경을 최소화하는 PoC로 container.admin을 부여한다. 운영에서는 초기 생성과 실행을 분리하여 권한을 축소한다.
