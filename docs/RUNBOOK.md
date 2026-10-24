@@ -403,23 +403,62 @@ gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" \
   --project="$EDGE_PROJECT" --location="$REGION" \
   --member="user:${EXEC_ACCOUNT}" --role=roles/artifactregistry.reader
 
-gcloud projects add-iam-policy-binding "$EDGE_PROJECT" \
-  --member="user:${CREATE_VM_ACCOUNT}" --role=roles/cloudbuild.builds.editor
-gcloud iam service-accounts add-iam-policy-binding "$BUILD_SA" \
-  --project="$EDGE_PROJECT" --member="user:${CREATE_VM_ACCOUNT}" --role=roles/iam.serviceAccountUser
+# 빌드 제출자는 Edge Owner user01이다. cho에게 빌드 권한을 추가하는 단계는 사용하지 않는다.
 ```
 
-l2comn-dev에서 저장소 clone 이후 실행한다. GitHub Trigger 연결을 새로 만들지 않는 단순 수동 빌드 방식이다.
-소스 업로드 staging bucket 권한이 부족하면 빌드 전에 관리자가 해당 bucket에 생성 사용자의 storage.objects.create/get 권한을 부여한다.
+l2comn-dev에서 저장소 clone 이후 Edge Owner user01@sonmap.net으로 실행한다. VM 위치와 빌드 제출 계정은 별개다.
+GitHub Trigger 연결을 새로 만들지 않는 단순 수동 빌드 방식이다.
+cho로 제출하여 gcp-sbx-edp-gke01_cloudbuild 버킷 접근이 거부된 경우 user01로 전환한 뒤 다시 실행한다.
+user01로도 거부되면 실제 활성 계정과 버킷·조직 정책을 확인한다. --no-source로 우회하지 않는다.
 커스텀 Build SA의 storage.objectViewer는 소스 다운로드용이며 필요 시 staging bucket 범위로 축소한다.
 
 ```bash
-gcloud auth login "$CREATE_VM_ACCOUNT"
+gcloud auth login "$EDGE_OWNER"
+gcloud config set account "$EDGE_OWNER"
+gcloud auth list --filter=status:ACTIVE
 gcloud builds submit . --project="$EDGE_PROJECT" --region="$REGION" \
   --config=cloudbuild/cloudbuild.yaml --substitutions="_IMAGE_URI=${DOCKER_IMAGE}"
 gcloud artifacts docker images list "${REGION}-docker.pkg.dev/${EDGE_PROJECT}/${REPO_NAME}" \
   --project="$EDGE_PROJECT" --include-tags
 ```
+
+### 5-A. Edge AR 이미지 재지정 및 이미지 없음 복구
+
+| 구분 | 지정 값 |
+|---|---|
+| AR 프로젝트 (Edge) | gcp-sbx-edp-gke01 |
+| GKE 프로젝트 | gcp-sbx-edp-comn-509423 |
+| 이미지 전체 주소 | asia-northeast3-docker.pkg.dev/gcp-sbx-edp-gke01/ar-l2comm-python/python-bq-batch:v1 |
+| 빌드 제출 사용자 | user01@sonmap.net |
+| 실제 빌드 실행 SA | cloudbuild.yaml의 sa-l2comm-build |
+| Pod 이미지 다운로드 주체 | GKE Node SA (KSA나 .oefj 계정이 아님) |
+
+AR 저장소 생성만으로 이미지는 등록되지 않는다. Listed 0 items는 저장소가 비었다는 뜻이다.
+Pod 이벤트의 not found는 요청한 이미지/태그를 찾지 못한 경우다. 403이나 timeout이면 권한·연결을 별도로 확인한다.
+
+```bash
+export DOCKER_IMAGE="asia-northeast3-docker.pkg.dev/gcp-sbx-edp-gke01/ar-l2comm-python/python-bq-batch:v1"
+
+gcloud artifacts docker images list \
+  asia-northeast3-docker.pkg.dev/gcp-sbx-edp-gke01/ar-l2comm-python \
+  --project=gcp-sbx-edp-gke01 --include-tags
+```
+
+이미지 또는 v1 태그가 없을 때만 위 5절의 user01 빌드를 실행한다. SUCCESS 후 다시 목록을 확인한다.
+등록된 동일 이미지로 재실행할 때는 이미지 빌드를 반복하지 않는다.
+실제 Pod 요청 주소도 확인한다. POD_NAME은 조회하려는 실제 이름으로 지정한다.
+
+```bash
+kubectl get pods -n l2comm-batch
+export POD_NAME="l2comm-20261024-120000-20261024122226"
+kubectl get pod "$POD_NAME" -n l2comm-batch \
+  -o jsonpath='{.spec.containers[0].image}{"\\n"}'
+kubectl describe pod "$POD_NAME" -n l2comm-batch
+```
+
+DOCKER_IMAGE를 export하면 새 run-gke.sh 실행에 적용된다. 이미 생성된 Pod의 이미지 주소는 바뀌지 않는다.
+기존 Pod가 같은 주소로 ImagePullBackOff 상태이면 이미지 등록 후 자동 재시도한다.
+.oefj만 수정한 경우는 이미지 재빌드가 필요 없다. 키는 NFS에서 읽는다.
 
 ## 6. 두 VM 모두 — Git 소스 배치
 
@@ -484,6 +523,44 @@ NFS 마운트는 Node에서 발생하므로 Node CIDR을 허용한다. 상위 de
 central02는 Spot VM이므로 정지·회수 시 NFS도 중단된다. 재시작 후 bind mount/export 상태를 확인한다.
 이 구성에서 Filestore는 새로 생성하지 않는다.
 
+### 7-A. .oefj 배치·확인 — central02만
+
+키 내용은 Git, 로그, 채팅에 출력하지 않는다. 기존 승인된 키를 사용하며 새 키 생성은 하지 않는다.
+
+| 위치 | 경로 |
+|---|---|
+| central02 원본 | ~/Gcp_Managed_GKE_L2Comm03-01_re/mnt/batch_gke/l2/rsvp/.oefj |
+| central02 bind mount | /srv/l2comm-nfs/batch_gke/l2/rsvp/.oefj |
+| NFS에서 공유하는 하위 경로 | /batch_gke/l2/rsvp |
+| Pod에서 읽는 경로 | /home/jupyter/.oefj |
+
+l2comn-dev에만 복사하면 central02의 NFS에 반영되지 않는다.
+central02에서 기존 파일을 덮어쓸지 확인한 뒤, 승인된 전달 방법으로 키를 위 원본 경로에 복사한다.
+아래 SOURCE_KEY는 central02에 이미 안전하게 전달된 파일의 실제 경로로 변경한다.
+
+```bash
+cd ~/Gcp_Managed_GKE_L2Comm03-01_re
+export SOURCE_KEY="/approved/path/to/.oefj"
+cp -i -- "$SOURCE_KEY" mnt/batch_gke/l2/rsvp/.oefj
+```
+
+이미 복사했다면 cp를 생략하고 파일 존재·소유자·권한·bind mount만 확인한다.
+
+```bash
+ls -l mnt/batch_gke/l2/rsvp/.oefj
+findmnt /srv/l2comm-nfs
+ls -l /srv/l2comm-nfs/batch_gke/l2/rsvp/.oefj
+namei -l /srv/l2comm-nfs/batch_gke/l2/rsvp/.oefj
+git check-ignore mnt/batch_gke/l2/rsvp/.oefj
+```
+
+git check-ignore 출력이 없으면 키를 add/commit하지 말고 제외 규칙을 먼저 확인한다.
+Missing or unreadable SA key는 파일 부재 또는 읽기 권한 문제다.
+NFS root_squash 환경에서는 Pod의 root도 파일 소유자의 root 권한을 그대로 사용하지 못한다.
+Pod의 실제 UID/GID, 키 소유자와 읽기 권한, 상위 디렉터리 탐색 권한을 함께 확인한다.
+무조건 chmod 777로 해결하지 않는다. 승인된 UID/GID·그룹·ACL 정책에 맞춰 읽기 권한을 부여한다.
+Failed Pod는 파일 복사 후 자동 재실행되지 않으므로 9-A 절차로 Pod만 삭제하고 재실행한다.
+
 ## 8. SVC 관리자 admin@sonmap.net — central02 실행 사용자의 GKE 권한
 
 기존 client_gke는 Namespace/KSA/PV/PVC/Pod를 생성·적용한다. PV와 Namespace는 클러스터 범위 리소스다.
@@ -527,6 +604,48 @@ export DRY_RUN=1
 프로그램은 Pod를 직접 생성하고 성공 로그를 가져온 후 Pod를 삭제한다. Job으로 변경하지 않는다.
 기존 PV/PVC의 server/path 변경은 불변 필드 제약을 확인한다. 자동 삭제·재생성하지 않는다.
 키 소유 SA에는 기존 BigQuery job/data 권한이 필요하다. BQ 인증 방식은 유지한다.
+
+### 9-A. .oefj 보완 후 실패한 Pod 삭제·재실행
+
+이미지 다운로드가 성공한 뒤 Exit Code 2와 Missing or unreadable SA key가 나오면 7-A부터 확인한다.
+PV/PVC와 이미지는 유지하고 실패한 Pod만 삭제한다. kubectl 권한이 있는 VM에서 실행한다.
+삭제 대상 이름과 Failed 상태를 먼저 확인한다.
+
+```bash
+export FAILED_POD="l2comm-20261024-120000-20261024122226"
+kubectl get pod "$FAILED_POD" -n l2comm-batch
+kubectl delete pod "$FAILED_POD" -n l2comm-batch
+```
+
+central02에서 user01로 GKE 접속을 준비한 뒤 기존 wrapper를 실행한다.
+0절 변수가 없는 새 터미널에서도 아래의 명시적 값으로 접속할 수 있다.
+
+```bash
+cd ~/Gcp_Managed_GKE_L2Comm03-01_re
+gcloud auth login user01@sonmap.net
+export KUBECONFIG="$HOME/.kube/config_new-autopilot"
+gcloud container clusters get-credentials gkea-prod-l2comn-batch \
+  --project=gcp-sbx-edp-comn-509423 --region=asia-northeast3 --internal-ip
+
+export DOCKER_IMAGE="asia-northeast3-docker.pkg.dev/gcp-sbx-edp-gke01/ar-l2comm-python/python-bq-batch:v1"
+export NFS_SERVER="172.32.10.4"
+export NFS_PATH="/batch_gke/l2/rsvp"
+export SA_KEY_PATH="/home/jupyter/.oefj"
+export BQ_JOB_PROJECT="pjt-c-admin"
+export DRY_RUN=0
+export RUN_YMD="$(date +%Y%m%d)"
+export RUN_TIME="$(date +%H%M%S)"
+
+./mnt/batch_gke/l2_gke_sh/rsvp/GP_L2RSVP_001_1/run-gke.sh \
+  "$RUN_YMD" "$RUN_YMD" "$RUN_YMD" "$RUN_TIME" \
+  0 4 16 \
+  /mnt/batch_gke/l2/rsvp/GP_L2RSVP_001_1/python \
+  python bq_auth_smoke.py
+```
+
+NFS_SERVER는 central02의 실제 내부 IP와 일치시킨다.
+成功時は既存client_gkeがログを表示してPodを削除する。失敗時は新しいPod名でdescribe/logsを確認する。
+この手順はPod削除・再実行用の文書であり、Git更新時に実機のPod削除やキーコピーを自動実行しない。
 
 ## 10. 확인
 
