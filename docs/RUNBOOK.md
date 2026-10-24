@@ -1,0 +1,338 @@
+# L2Comm03-01_re 실행 절차
+
+인프라는 아래 gcloud 명령을 단계별로 실행한다. 인프라 생성용 shell 파일을 실행하지 않는다.
+NFS 설정만 setup-nfs-server.sh를 사용한다. 기존 run-gke.sh / client_gke의 업무 실행은 유지한다.
+명령은 실제 클라우드에 적용하지 않은 절차이며 각 단계 출력 확인 후 다음 단계로 진행한다.
+기존 리소스가 있으면 describe로 확인하고 create를 생략한다. 실패를 무시하고 진행하지 않는다.
+
+## 0. 프로젝트와 변수 — 각 작업 터미널에서 정의
+
+| 변수 | 프로젝트 | 역할 |
+|---|---|---|
+| HOST_PROJECT | gcp-prod-edp-hub-vpchost | Shared VPC, 서브넷, 방화벽 |
+| EDGE_PROJECT | gcp-sbx-edp-gke01 | central02, AR, 빌드, NFS |
+| SVC_PROJECT | gcp-sbx-edp-comn-509423 | GKE Autopilot |
+| CREATE_VM_PROJECT | gcp-prod-edp-edge-509423 | 생성 VM l2comn-dev |
+
+아래 대역은 사전 IP 승인 및 기존 VPC/피어링/VPN/사내망과 중복 확인이 필요하다.
+Node /28은 기본 예약 제외 12개 주소만 제공한다. Pod /22 수용량은 노드별 할당량에 따라 달라진다.
+
+```bash
+export HOST_PROJECT="gcp-prod-edp-hub-vpchost"
+export EDGE_PROJECT="gcp-sbx-edp-gke01"
+export SVC_PROJECT="gcp-sbx-edp-comn-509423"
+export CREATE_VM_PROJECT="gcp-prod-edp-edge-509423"
+
+export HOST_PROJECT_NUM="$(gcloud projects describe "$HOST_PROJECT" --format='value(projectNumber)')"
+export EDGE_PROJECT_NUM="$(gcloud projects describe "$EDGE_PROJECT" --format='value(projectNumber)')"
+export SVC_PROJECT_NUM="$(gcloud projects describe "$SVC_PROJECT" --format='value(projectNumber)')"
+export CREATE_VM_PROJECT_NUM="$(gcloud projects describe "$CREATE_VM_PROJECT" --format='value(projectNumber)')"
+
+echo "$HOST_PROJECT_NUM $EDGE_PROJECT_NUM $SVC_PROJECT_NUM $CREATE_VM_PROJECT_NUM"
+
+export REGION="asia-northeast3"
+export VM_ZONE="asia-northeast3-a"
+export NETWORK="vpc-prod-edp-hub"
+export NODE_SUBNET="subnet-prod-l2comn-gke"
+export POD_RANGE="subnet-prod-l2comn-gke-pod"
+export CP_SUBNET="subnet-prod-l2comn-gke-cp"
+export NODE_CIDR="10.253.0.0/28"
+export POD_CIDR="10.253.4.0/22"
+export CP_CIDR="10.253.2.0/28"
+export CLUSTER="gkea-prod-l2comn-batch"
+export RELEASE_CHANNEL="regular"
+export CREATE_VM_ACCOUNT="cho@sonmap.net"
+export EXEC_ACCOUNT="user01@sonmap.net"
+export ADMIN_ACCOUNT="admin@sonmap.net"
+export NODE_SA="sa-l2comm-node@${SVC_PROJECT}.iam.gserviceaccount.com"
+export BUILD_SA="sa-l2comm-build@${EDGE_PROJECT}.iam.gserviceaccount.com"
+export REPO_NAME="ar-l2comm-python"
+export DOCKER_IMAGE="${REGION}-docker.pkg.dev/${EDGE_PROJECT}/${REPO_NAME}/python-bq-batch:v1"
+```
+
+프로젝트 번호가 모두 숫자인지 확인한다. 계정 변수 선언은 인증을 변경하지 않는다.
+각 VM에는 gcloud, git, kubectl, gke-gcloud-auth-plugin이 필요하다.
+사용자 로그인 방식이며 VM 부착 SA와 다르다. 사내 패키지 배포 절차로 도구를 준비한다.
+
+## 1. 관리자 — API와 Shared VPC 상태
+
+```bash
+gcloud auth login "$ADMIN_ACCOUNT"
+gcloud auth list --filter=status:ACTIVE
+gcloud services enable compute.googleapis.com container.googleapis.com --project="$HOST_PROJECT"
+gcloud services enable compute.googleapis.com container.googleapis.com iam.googleapis.com --project="$SVC_PROJECT"
+gcloud services enable compute.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com iam.googleapis.com --project="$EDGE_PROJECT"
+
+gcloud compute shared-vpc get-host-project "$SVC_PROJECT"
+gcloud compute shared-vpc get-host-project "$EDGE_PROJECT"
+gcloud compute shared-vpc get-host-project "$CREATE_VM_PROJECT"
+gcloud compute networks subnets list --project="$HOST_PROJECT" --network="$NETWORK"
+```
+
+SVC/EDGE/생성 VM 프로젝트가 이미 같은 Host에 연결되었다면 변경하지 않는다.
+SVC 또는 EDGE가 미연결인 경우만 Shared VPC 관리자가 다음을 실행한다.
+다른 Host에 연결된 프로젝트를 자동으로 분리하지 않는다.
+
+```bash
+gcloud compute shared-vpc associated-projects add "$SVC_PROJECT" --host-project="$HOST_PROJECT"
+gcloud compute shared-vpc associated-projects add "$EDGE_PROJECT" --host-project="$HOST_PROJECT"
+```
+
+## 2. Host 관리자 — 네트워크
+
+```bash
+gcloud compute networks subnets create "$NODE_SUBNET" \
+  --project="$HOST_PROJECT" --region="$REGION" --network="$NETWORK" \
+  --range="$NODE_CIDR" --secondary-range="${POD_RANGE}=${POD_CIDR}" \
+  --enable-private-ip-google-access
+
+gcloud compute networks subnets create "$CP_SUBNET" \
+  --project="$HOST_PROJECT" --region="$REGION" --network="$NETWORK" \
+  --range="$CP_CIDR"
+
+gcloud compute networks subnets describe "$NODE_SUBNET" --project="$HOST_PROJECT" --region="$REGION"
+gcloud compute networks subnets describe "$CP_SUBNET" --project="$HOST_PROJECT" --region="$REGION"
+```
+
+별도 Service Secondary는 생성하지 않고 GKE 관리형 Service 범위를 사용한다.
+Private Google Access는 인터넷 연결을 제공하지 않는다. VM의 apt/GitHub 접속은 기존 사내 프록시·NAT 등의 경로가 필요하다.
+이 절차는 NAT를 새로 만들지 않는다.
+
+## 3. 관리자 — GKE 서비스 에이전트와 Node SA
+
+```bash
+gcloud beta services identity create --service=container.googleapis.com --project="$HOST_PROJECT"
+gcloud beta services identity create --service=container.googleapis.com --project="$SVC_PROJECT"
+
+gcloud projects add-iam-policy-binding "$HOST_PROJECT" \
+  --member="serviceAccount:service-${SVC_PROJECT_NUM}@container-engine-robot.iam.gserviceaccount.com" \
+  --role=roles/container.hostServiceAgentUser
+
+gcloud compute networks subnets add-iam-policy-binding "$NODE_SUBNET" \
+  --project="$HOST_PROJECT" --region="$REGION" \
+  --member="serviceAccount:service-${SVC_PROJECT_NUM}@container-engine-robot.iam.gserviceaccount.com" \
+  --role=roles/compute.networkUser
+
+gcloud compute networks subnets add-iam-policy-binding "$CP_SUBNET" \
+  --project="$HOST_PROJECT" --region="$REGION" \
+  --member="serviceAccount:service-${SVC_PROJECT_NUM}@container-engine-robot.iam.gserviceaccount.com" \
+  --role=roles/compute.networkUser
+
+gcloud compute networks subnets add-iam-policy-binding "$NODE_SUBNET" \
+  --project="$HOST_PROJECT" --region="$REGION" \
+  --member="serviceAccount:${SVC_PROJECT_NUM}@cloudservices.gserviceaccount.com" \
+  --role=roles/compute.networkUser
+
+gcloud compute networks subnets add-iam-policy-binding "$CP_SUBNET" \
+  --project="$HOST_PROJECT" --region="$REGION" \
+  --member="serviceAccount:${SVC_PROJECT_NUM}@cloudservices.gserviceaccount.com" \
+  --role=roles/compute.networkUser
+
+gcloud compute networks subnets add-iam-policy-binding "$NODE_SUBNET" \
+  --project="$HOST_PROJECT" --region="$REGION" \
+  --member="user:${CREATE_VM_ACCOUNT}" --role=roles/compute.networkUser
+
+gcloud compute networks subnets add-iam-policy-binding "$CP_SUBNET" \
+  --project="$HOST_PROJECT" --region="$REGION" \
+  --member="user:${CREATE_VM_ACCOUNT}" --role=roles/compute.networkUser
+
+gcloud iam service-accounts create sa-l2comm-node --project="$SVC_PROJECT"
+gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
+  --member="serviceAccount:${NODE_SA}" --role=roles/container.defaultNodeServiceAccount
+gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
+  --member="user:${CREATE_VM_ACCOUNT}" --role=roles/container.admin
+gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
+  --member="user:${CREATE_VM_ACCOUNT}" --role=roles/serviceusage.serviceUsageConsumer
+gcloud iam service-accounts add-iam-policy-binding "$NODE_SA" \
+  --project="$SVC_PROJECT" --member="user:${CREATE_VM_ACCOUNT}" --role=roles/iam.serviceAccountUser
+```
+
+Shared VPC 방화벽 자동 관리를 허용하는 운영 방식을 사용할 경우, SVC의 GKE 서비스 에이전트에 다음 권한을 적용한다.
+compute.securityAdmin은 Host 전체 방화벽에 대한 넓은 권한이다. 조직에서 허용하지 않으면 Host 관리자가 공식 GKE 필수 방화벽을 수동 관리하는 방식으로 대체한 후 생성한다.
+
+```bash
+gcloud projects add-iam-policy-binding "$HOST_PROJECT" \
+  --member="serviceAccount:service-${SVC_PROJECT_NUM}@container-engine-robot.iam.gserviceaccount.com" \
+  --role=roles/compute.securityAdmin
+```
+
+## 4. l2comn-dev — GKE만 생성
+
+```bash
+gcloud auth login "$CREATE_VM_ACCOUNT"
+gcloud container clusters create-auto "$CLUSTER" \
+  --project="$SVC_PROJECT" --region="$REGION" \
+  --network="projects/${HOST_PROJECT}/global/networks/${NETWORK}" \
+  --subnetwork="projects/${HOST_PROJECT}/regions/${REGION}/subnetworks/${NODE_SUBNET}" \
+  --cluster-secondary-range-name="$POD_RANGE" \
+  --private-endpoint-subnetwork="projects/${HOST_PROJECT}/regions/${REGION}/subnetworks/${CP_SUBNET}" \
+  --enable-private-nodes --enable-private-endpoint \
+  --no-enable-authorized-networks-on-private-endpoint \
+  --service-account="$NODE_SA" --scopes=cloud-platform \
+  --release-channel="$RELEASE_CHANNEL"
+
+gcloud container clusters describe "$CLUSTER" --project="$SVC_PROJECT" --region="$REGION"
+```
+
+관리 VM IP는 승인 네트워크에 등록하지 않고 Private Endpoint에 승인 네트워크 제한을 강제하지 않는 설계다.
+TCP 443 경로와 IAM/Kubernetes 인증은 별도로 필요하다. 다른 리전에서 접속하면 global access 필요 여부를 확인한다.
+위 설정은 사설 Endpoint에 도달 가능한 다른 호스트도 네트워크 차원에서 접근할 수 있게 하며, API 작업에는 인증·권한이 필요하다.
+
+## 5. 관리자 — AR와 빌드
+
+```bash
+gcloud auth login "$ADMIN_ACCOUNT"
+gcloud artifacts repositories create "$REPO_NAME" --project="$EDGE_PROJECT" \
+  --location="$REGION" --repository-format=docker
+gcloud iam service-accounts create sa-l2comm-build --project="$EDGE_PROJECT"
+
+gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" \
+  --project="$EDGE_PROJECT" --location="$REGION" \
+  --member="serviceAccount:${BUILD_SA}" --role=roles/artifactregistry.writer
+gcloud projects add-iam-policy-binding "$EDGE_PROJECT" \
+  --member="serviceAccount:${BUILD_SA}" --role=roles/logging.logWriter
+gcloud projects add-iam-policy-binding "$EDGE_PROJECT" \
+  --member="serviceAccount:${BUILD_SA}" --role=roles/storage.objectViewer
+
+gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" \
+  --project="$EDGE_PROJECT" --location="$REGION" \
+  --member="serviceAccount:${NODE_SA}" --role=roles/artifactregistry.reader
+gcloud artifacts repositories add-iam-policy-binding "$REPO_NAME" \
+  --project="$EDGE_PROJECT" --location="$REGION" \
+  --member="user:${EXEC_ACCOUNT}" --role=roles/artifactregistry.reader
+
+gcloud projects add-iam-policy-binding "$EDGE_PROJECT" \
+  --member="user:${CREATE_VM_ACCOUNT}" --role=roles/cloudbuild.builds.editor
+gcloud iam service-accounts add-iam-policy-binding "$BUILD_SA" \
+  --project="$EDGE_PROJECT" --member="user:${CREATE_VM_ACCOUNT}" --role=roles/iam.serviceAccountUser
+```
+
+l2comn-dev에서 저장소 clone 이후 실행한다. GitHub Trigger 연결을 새로 만들지 않는 단순 수동 빌드 방식이다.
+소스 업로드 staging bucket 권한이 부족하면 빌드 전에 관리자가 해당 bucket에 생성 사용자의 storage.objects.create/get 권한을 부여한다.
+커스텀 Build SA의 storage.objectViewer는 소스 다운로드용이며 필요 시 staging bucket 범위로 축소한다.
+
+```bash
+gcloud auth login "$CREATE_VM_ACCOUNT"
+gcloud builds submit . --project="$EDGE_PROJECT" --region="$REGION" \
+  --config=cloudbuild/cloudbuild.yaml --substitutions="_IMAGE_URI=${DOCKER_IMAGE}"
+gcloud artifacts docker images list "${REGION}-docker.pkg.dev/${EDGE_PROJECT}/${REPO_NAME}" \
+  --project="$EDGE_PROJECT" --include-tags
+```
+
+## 6. 두 VM 모두 — Git 소스 배치
+
+l2comn-dev와 central02 각각의 터미널에서 수행한다. VM에 직접 원격 배포하는 단계가 아니라 사용자가 실행할 명령이다.
+GitHub 인증은 기존 계정/credential helper를 사용한다.
+
+```bash
+git clone https://github.com/sonmap/Gcp_Managed_GKE_L2Comm03-01_re.git
+cd Gcp_Managed_GKE_L2Comm03-01_re
+git log -1 --oneline
+```
+
+이미 clone했으면 해당 디렉터리에서 git pull --ff-only를 사용한다.
+l2comn-dev는 소스 보관과 GKE 생성/빌드만 수행하며 mnt 마운트와 NFS 설정은 하지 않는다.
+
+## 7. central02만 — 실행 파일 배치와 NFS
+
+실제 IP와 Zone을 확인한 후 공통 기본 NFS_SERVER와 일치시킨다.
+
+```bash
+gcloud compute instances describe central02 --project="$EDGE_PROJECT" --zone="$VM_ZONE" \
+  --format='value(networkInterfaces[0].networkIP)'
+```
+
+central02 내부에서 실행한다. /ssw/dlk가 기존 다른 경로이면 먼저 확인하며 덮어쓰지 않는다.
+install-vm.sh는 사용하지 않는다.
+
+```bash
+chmod +x ssw/dlk/run-gke.sh ssw/dlk/client_gke ssw/dlk/setup-nfs-server.sh
+chmod +x mnt/batch_gke/l2_gke_sh/rsvp/GP_L2RSVP_001_1/run-gke.sh
+sudo mkdir -p /ssw
+sudo ln -s "$PWD/ssw/dlk" /ssw/dlk
+sudo env NFS_CLIENT_CIDR="$NODE_CIDR" bash ssw/dlk/setup-nfs-server.sh
+findmnt /srv/l2comm-nfs
+sudo exportfs -v
+```
+
+NFS 스크립트는 central02의 저장소 mnt를 /srv/l2comm-nfs에 bind mount한다.
+NFSv4 fsid=0을 사용하며 Pod는 /batch_gke/l2/rsvp를 /home/jupyter에 읽기 전용 마운트한다.
+.oefj는 기존 승인된 키를 central02의 mnt/batch_gke/l2/rsvp/.oefj에 안전하게 배치한다. Git에 추가하지 않는다.
+root_squash 및 Pod 실행 UID 기준으로 읽기 가능한지 확인한다. 키 생성·조직 정책 변경은 수행하지 않는다.
+
+Host 관리자가 실행한다. IAP SSH 규칙은 기존 규칙을 확인한 후 필요한 경우만 추가한다.
+
+```bash
+gcloud compute instances add-tags central02 --project="$EDGE_PROJECT" --zone="$VM_ZONE" \
+  --tags=iap-ssh-central02,l2comm-nfs
+gcloud compute firewall-rules create allow-l2comm-nfs-from-gke --project="$HOST_PROJECT" \
+  --network="$NETWORK" --direction=INGRESS --priority=1000 --action=ALLOW \
+  --rules=tcp:2049 --source-ranges="$NODE_CIDR" --target-tags=l2comm-nfs
+gcloud compute firewall-rules create allow-iap-ssh-central02 --project="$HOST_PROJECT" \
+  --network="$NETWORK" --direction=INGRESS --priority=1000 --action=ALLOW \
+  --rules=tcp:22 --source-ranges=35.235.240.0/20 --target-tags=iap-ssh-central02
+```
+
+NFS 마운트는 Node에서 발생하므로 Node CIDR을 허용한다. 상위 deny 및 OS 방화벽도 확인한다.
+central02는 Spot VM이므로 정지·회수 시 NFS도 중단된다. 재시작 후 bind mount/export 상태를 확인한다.
+이 구성에서 Filestore는 새로 생성하지 않는다.
+
+## 8. 관리자 — central02 실행 사용자의 GKE 권한
+
+기존 client_gke는 Namespace/KSA/PV/PVC/Pod를 생성·적용한다. PV와 Namespace는 클러스터 범위 리소스다.
+변경을 최소화하는 PoC로 container.admin을 부여한다. 운영에서는 초기 생성과 실행을 분리하여 권한을 축소한다.
+
+```bash
+gcloud projects add-iam-policy-binding "$SVC_PROJECT" \
+  --member="user:${EXEC_ACCOUNT}" --role=roles/container.admin
+```
+
+central02에서 실행한다. VM SSH 인증 권한과 GKE 권한은 별개다.
+
+```bash
+gcloud auth login "$EXEC_ACCOUNT"
+export KUBECONFIG="$HOME/.kube/config_new-autopilot"
+gcloud container clusters get-credentials "$CLUSTER" \
+  --project="$SVC_PROJECT" --region="$REGION" --internal-ip
+kubectl auth can-i create persistentvolumes
+kubectl auth can-i create pods --namespace=l2comm-batch
+kubectl get nodes -o wide
+```
+
+## 9. central02 — 기존 run-gke.sh 실행
+
+```bash
+export NFS_SERVER="172.32.10.4"
+export NFS_PATH="/batch_gke/l2/rsvp"
+export BQ_JOB_PROJECT="pjt-c-admin"
+export SA_KEY_PATH="/home/jupyter/.oefj"
+export DRY_RUN=1
+
+./mnt/batch_gke/l2_gke_sh/rsvp/GP_L2RSVP_001_1/run-gke.sh \
+  20261024 20261024 20261024 120000 \
+  0 4 16 \
+  /mnt/batch_gke/l2/rsvp/GP_L2RSVP_001_1/python \
+  python bq_auth_smoke.py
+```
+
+출력된 image/NFS/CPU/memory/인증 경로를 확인한 후 DRY_RUN=0으로 같은 명령을 실행한다.
+프로그램은 Pod를 직접 생성하고 성공 로그를 가져온 후 Pod를 삭제한다. Job으로 변경하지 않는다.
+기존 PV/PVC의 server/path 변경은 불변 필드 제약을 확인한다. 자동 삭제·재생성하지 않는다.
+키 소유 SA에는 기존 BigQuery job/data 권한이 필요하다. BQ 인증 방식은 유지한다.
+
+## 10. 確認
+
+```bash
+gcloud container clusters describe "$CLUSTER" --project="$SVC_PROJECT" --region="$REGION" \
+  --format='yaml(name,network,subnetwork,ipAllocationPolicy,privateClusterConfig,nodeConfig.serviceAccount)'
+kubectl get pv
+kubectl get pvc,pods -n l2comm-batch -o wide
+```
+
+실환경 미검증 항목: IP 중복·여유, 조직 정책, 할당량, API 연결, 실제 VM IP, IAM 반영, 패키지 다운로드 경로, NFS/BQ 실행.
+원본 보존: archive/original에 원본 파일을 보관한다. 기존 gcloud/*.sh는 실행 대상이 아니다.
+
+공식 자료:
+- https://docs.cloud.google.com/kubernetes-engine/docs/how-to/cluster-shared-vpc
+- https://docs.cloud.google.com/sdk/gcloud/reference/container/clusters/create-auto
+- https://docs.cloud.google.com/artifact-registry/docs/integrate-gke

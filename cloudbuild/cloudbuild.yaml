@@ -1,0 +1,19 @@
+substitutions:
+  _IMAGE_URI: asia-northeast3-docker.pkg.dev/gcp-sbx-edp-gke01/ar-l2comm-python/python-bq-batch:v1
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    dir: app
+    args:
+      - build
+      - -t
+      - ${_IMAGE_URI}
+      - .
+
+images:
+  - ${_IMAGE_URI}
+
+serviceAccount: projects/gcp-sbx-edp-gke01/serviceAccounts/sa-l2comm-build@gcp-sbx-edp-gke01.iam.gserviceaccount.com
+
+options:
+  logging: CLOUD_LOGGING_ONLY

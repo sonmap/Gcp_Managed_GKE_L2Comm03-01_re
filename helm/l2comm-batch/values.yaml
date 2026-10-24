@@ -1,0 +1,9 @@
+serviceAccount:
+  create: true
+  name: ksa-l2comm-batch
+  gcpServiceAccount: ""
+
+image:
+  repository: asia-northeast3-docker.pkg.dev/gcp-sbx-edp-gke01/ar-l2comm-python/python-bq-batch
+  tag: v1
+  pullPolicy: IfNotPresent
